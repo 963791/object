@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import cv2
 import numpy as np
@@ -6,98 +5,117 @@ from PIL import Image
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
-# -----------------------------
-# Initialize Models
-# -----------------------------
 st.set_page_config(page_title="Object Detection & Tracking", layout="wide")
-st.title("🟢 Object Detection & Tracking System")
 
-# Load YOLO model
-model = YOLO("yolov8n.pt")
+# -------------------------------
+# Load high-accuracy YOLO model
+# -------------------------------
+@st.cache_resource
+def load_model():
+    return YOLO("yolov8x.pt")   # Much more accurate than yolov8n or s
 
-# Initialize DeepSort tracker
-tracker = DeepSort(max_age=30)
+model = load_model()
 
-# -----------------------------
-# Input Options
-# -----------------------------
-input_type = st.radio("Select Input Type:", ["Webcam", "Image Upload", "Video Upload"])
+# DeepSORT Tracker
+tracker = DeepSort(max_age=10, n_init=2)
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
+
+# -------------------------------
+# VERY IMPORTANT — clean prediction method
+# -------------------------------
 def detect_objects(frame):
-    results = model(frame)[0]
-    for box, cls in zip(results.boxes.xyxy, results.boxes.cls):
-        x1, y1, x2, y2 = map(int, box)
-        label = model.names[int(cls)]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
-        cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
-    return frame
+    # Preprocessing for accuracy
+    frame = cv2.GaussianBlur(frame, (3,3), 0)
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-def track_objects(frame):
-    results = model.predict(frame)[0]  # YOLO predictions
+    results = model.predict(
+        frame,
+        conf=0.45,          # higher confidence = fewer mistakes
+        iou=0.5,            # improved NMS
+        imgsz=640
+    )
+
     detections = []
+    for r in results:
+        for box in r.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            conf = float(box.conf.cpu().numpy())
+            cls = int(box.cls.cpu().numpy())
 
-    # Convert YOLO boxes to DeepSORT format
-    for box, cls in zip(results.boxes.xyxy, results.boxes.cls):
-        x1, y1, x2, y2 = map(int, box)
-        score = 0.99  # or use result.boxes.conf if available
-        detections.append(([x1, y1, x2, y2], score))  # ✅ Correct format
+            if conf < 0.45:
+                continue
 
+            detections.append([x1, y1, x2-x1, y2-y1, conf, cls])
+
+    return detections, results
+
+
+def track_objects(frame, detections):
     tracks = tracker.update_tracks(detections, frame=frame)
-
-    for track in tracks:
-        if not track.is_confirmed():
-            continue
-        x1, y1, x2, y2 = map(int, track.to_ltrb())
-        track_id = track.track_id
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(frame, f"ID: {track_id}", (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-    return frame
+    return tracks
 
 
-# -----------------------------
-# 1️⃣ Webcam Input
-# -----------------------------
-if input_type == "Webcam":
-    webcam_frame = st.camera_input("Capture from Webcam")
-    if webcam_frame is not None:
-        # Convert to OpenCV format
-        img = np.array(Image.open(webcam_frame))
-        img = detect_objects(img)  # Object detection
-        img = track_objects(img)   # Object tracking
-        st.image(img, channels="RGB")
+# -------------------------------
+# Streamlit UI
+# -------------------------------
+st.title("🔍 Object Detection & Tracking – Ultra Accurate Version")
 
-# -----------------------------
-# 2️⃣ Image Upload
-# -----------------------------
-elif input_type == "Image Upload":
-    uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
-    if uploaded_file is not None:
-        img = np.array(Image.open(uploaded_file))
-        img = detect_objects(img)
-        img = track_objects(img)
-        st.image(img, channels="RGB")
+st.sidebar.header("Choose Input Source")
+mode = st.sidebar.radio("Select Mode", ["Image Upload", "Video Upload", "Webcam Snapshot"])
 
-# -----------------------------
-# 3️⃣ Video Upload
-# -----------------------------
-elif input_type == "Video Upload":
-    uploaded_video = st.file_uploader("Upload a video", type=["mp4", "avi"])
-    if uploaded_video is not None:
-        tfile = uploaded_video.name
-        with open(tfile, 'wb') as f:
-            f.write(uploaded_video.read())
-        
-        cap = cv2.VideoCapture(tfile)
+# -----------------------------------
+# IMAGE UPLOAD MODE
+# -----------------------------------
+if mode == "Image Upload":
+    uploaded_img = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
+
+    if uploaded_img is not None:
+        img = Image.open(uploaded_img)
+        img = np.array(img)
+
+        detections, results = detect_objects(img)
+        tracks = track_objects(img, detections)
+
+        # Draw results
+        res = results[0].plot()
+
+        st.image(res, caption="Detections", use_column_width=True)
+
+# -----------------------------------
+# VIDEO UPLOAD MODE
+# -----------------------------------
+elif mode == "Video Upload":
+    uploaded_vid = st.file_uploader("Upload Video", type=["mp4", "avi", "mov"])
+    
+    if uploaded_vid is not None:
         stframe = st.empty()
-        while cap.isOpened():
-            ret, frame = cap.read()
+
+        video = cv2.VideoCapture(uploaded_vid.read())
+        while True:
+            ret, frame = video.read()
             if not ret:
                 break
-            frame = detect_objects(frame)
-            frame = track_objects(frame)
-            stframe.image(frame, channels="RGB")
-        cap.release()
+
+            detections, results = detect_objects(frame)
+            tracks = track_objects(frame, detections)
+
+            out = results[0].plot()
+            stframe.image(out, channels="RGB")
+
+# -----------------------------------
+# WEBCAM SNAPSHOT MODE
+# -----------------------------------
+elif mode == "Webcam Snapshot":
+    st.write("📸 Take a webcam picture for detection")
+
+    img_data = st.camera_input("Take Picture")
+
+    if img_data is not None:
+        img = Image.open(img_data)
+        img = np.array(img)
+
+        detections, results = detect_objects(img)
+        tracks = track_objects(img, detections)
+
+        res = results[0].plot()
+        st.image(res, caption="Detection Result", use_column_width=True)
