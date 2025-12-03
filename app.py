@@ -1,95 +1,103 @@
+# app.py
 import streamlit as st
-from ultralytics import YOLO
 import cv2
-from PIL import Image
 import numpy as np
-import tempfile
+from PIL import Image
+from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
 
-# -------------------------------
-# Load YOLOv8 Model
-# -------------------------------
-@st.cache_resource
-def load_model():
-    model = YOLO("yolov8x-o365")
-    return model
+# -----------------------------
+# Initialize Models
+# -----------------------------
+st.set_page_config(page_title="Object Detection & Tracking", layout="wide")
+st.title("🟢 Object Detection & Tracking System")
 
-model = load_model()
+# Load YOLO model
+model = YOLO("yolov8n.pt")
 
-# -------------------------------
-# Streamlit UI
-# -------------------------------
-st.set_page_config(page_title="YOLOv8 Object Detection", layout="wide")
-st.title("🟢 YOLOv8 Object Detection App")
-st.sidebar.title("Settings")
+# Initialize DeepSort tracker
+tracker = DeepSort(max_age=30)
 
-mode = st.sidebar.radio("Choose Detection Mode:", ["Webcam", "Image", "Video"])
+# -----------------------------
+# Input Options
+# -----------------------------
+input_type = st.radio("Select Input Type:", ["Webcam", "Image Upload", "Video Upload"])
 
-# -------------------------------
-# Webcam Detection
-# -------------------------------
-if mode == "Webcam":
-    stframe = st.empty()
-    cap = cv2.VideoCapture(0)
-    confidence = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.5)
+# -----------------------------
+# Helper Functions
+# -----------------------------
+def detect_objects(frame):
+    results = model(frame)[0]
+    for box, cls in zip(results.boxes.xyxy, results.boxes.cls):
+        x1, y1, x2, y2 = map(int, box)
+        label = model.names[int(cls)]
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+        cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+    return frame
 
-    if cap.isOpened():
-        st.info("Press Ctrl+C in terminal to stop webcam.")
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                st.warning("Could not read frame from webcam.")
-                break
-            results = model.predict(frame, conf=confidence)
-            annotated_frame = results[0].plot()
-            stframe.image(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB), channels="RGB")
-    else:
-        st.error("Webcam not detected.")
+def track_objects(frame):
+    results = model.predict(frame)[0]  # YOLO predictions
+    detections = []
 
-# -------------------------------
-# Image Detection
-# -------------------------------
-elif mode == "Image":
-    uploaded_file = st.file_uploader("Upload an Image", type=["jpg", "jpeg", "png"])
-    confidence = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.5)
+    # Convert YOLO boxes to DeepSORT format
+    for box, cls in zip(results.boxes.xyxy, results.boxes.cls):
+        x1, y1, x2, y2 = map(int, box)
+        score = 0.99  # or use result.boxes.conf if available
+        detections.append(([x1, y1, x2, y2], score))  # ✅ Correct format
 
+    tracks = tracker.update_tracks(detections, frame=frame)
+
+    for track in tracks:
+        if not track.is_confirmed():
+            continue
+        x1, y1, x2, y2 = map(int, track.to_ltrb())
+        track_id = track.track_id
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(frame, f"ID: {track_id}", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+    return frame
+
+
+# -----------------------------
+# 1️⃣ Webcam Input
+# -----------------------------
+if input_type == "Webcam":
+    webcam_frame = st.camera_input("Capture from Webcam")
+    if webcam_frame is not None:
+        # Convert to OpenCV format
+        img = np.array(Image.open(webcam_frame))
+        img = detect_objects(img)  # Object detection
+        img = track_objects(img)   # Object tracking
+        st.image(img, channels="RGB")
+
+# -----------------------------
+# 2️⃣ Image Upload
+# -----------------------------
+elif input_type == "Image Upload":
+    uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
     if uploaded_file is not None:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Original Image", use_column_width=True)
-        image_np = np.array(image)
-        results = model.predict(image_np, conf=confidence)
-        annotated_image = results[0].plot()
-        st.image(annotated_image, caption="Detected Objects", use_column_width=True)
+        img = np.array(Image.open(uploaded_file))
+        img = detect_objects(img)
+        img = track_objects(img)
+        st.image(img, channels="RGB")
 
-# -------------------------------
-# Video Detection
-# -------------------------------
-elif mode == "Video":
-    uploaded_file = st.file_uploader("Upload a Video", type=["mp4", "mov", "avi"])
-    confidence = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.5)
-
-    if uploaded_file is not None:
-        tfile = tempfile.NamedTemporaryFile(delete=False)
-        tfile.write(uploaded_file.read())
-        cap = cv2.VideoCapture(tfile.name)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-
-        out_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(out_file.name, fourcc, fps, (width, height))
-
+# -----------------------------
+# 3️⃣ Video Upload
+# -----------------------------
+elif input_type == "Video Upload":
+    uploaded_video = st.file_uploader("Upload a video", type=["mp4", "avi"])
+    if uploaded_video is not None:
+        tfile = uploaded_video.name
+        with open(tfile, 'wb') as f:
+            f.write(uploaded_video.read())
+        
+        cap = cv2.VideoCapture(tfile)
         stframe = st.empty()
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            results = model.predict(frame, conf=confidence)
-            annotated_frame = results[0].plot()
-            out.write(annotated_frame)
-            stframe.image(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB), channels="RGB")
-        
+            frame = detect_objects(frame)
+            frame = track_objects(frame)
+            stframe.image(frame, channels="RGB")
         cap.release()
-        out.release()
-        st.success("Detection completed!")
-        st.video(out_file.name)
