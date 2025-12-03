@@ -10,7 +10,7 @@ import tempfile
 # -------------------------------
 @st.cache_resource
 def load_model():
-    model = YOLO("yolov8x-o365.pt")
+    model = YOLO("yolov8x-o365")
     return model
 
 model = load_model()
